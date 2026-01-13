@@ -1,0 +1,181 @@
+
+# ============================================================
+# FOMCervix: Hybrid Federated Cervical Cancer Prediction
+# With SMOTE + Optuna + MLP + FedAvg + Ablation Study
+# ============================================================
+
+import pandas as pd
+import numpy as np
+import optuna
+
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score
+from imblearn.over_sampling import SMOTE
+
+# ------------------------------------------------------------
+# LOAD DATASET
+# ------------------------------------------------------------
+data = pd.read_csv(r'C:\Users\Subhasish_Mohapatra\risk_factors_cervical_cancer.csv')
+data = data.dropna()
+
+X = data.drop('Biopsy', axis=1).values
+y = data['Biopsy'].values
+
+# ------------------------------------------------------------
+# ABLATION CONFIGURATION
+# ------------------------------------------------------------
+ABLATION_CONFIG = {
+    "CLIENTS": 5,
+    "ROUNDS": 5,
+    "USE_FEDERATED": True,
+    "USE_SMOTE": True,
+    "USE_OPTUNA": True
+}
+
+# ------------------------------------------------------------
+# DATA PARTITIONING (CLIENTS)
+# ------------------------------------------------------------
+def partition_dataset(X, y, C):
+    data = np.c_[X, y]
+    np.random.shuffle(data)
+    return np.array_split(data, C)
+
+# ------------------------------------------------------------
+# DATA PREPARATION (SMOTE ABLATION)
+# ------------------------------------------------------------
+def prepare_data(client_data, use_smote):
+    X = client_data[:, :-1]
+    y = client_data[:, -1]
+
+    if use_smote:
+        sm = SMOTE(random_state=42)
+        X, y = sm.fit_resample(X, y)
+
+    return train_test_split(X, y, test_size=0.2, random_state=42)
+
+# ------------------------------------------------------------
+# LOCAL TRAINING (OPTUNA ABLATION)
+# ------------------------------------------------------------
+def local_train(X_train, X_val, y_train, y_val, use_optuna):
+
+    if not use_optuna:
+        model = MLPClassifier(hidden_layer_sizes=(64,),
+                              max_iter=300,
+                              random_state=42)
+        model.fit(X_train, y_train)
+        return model.coefs_, model.intercepts_
+
+    def objective(trial):
+        params = {
+            "hidden_layer_sizes": trial.suggest_categorical(
+                "hidden_layer_sizes", [(64,), (128,), (64, 32)]
+            ),
+            "activation": trial.suggest_categorical(
+                "activation", ["relu", "tanh"]
+            ),
+            "alpha": trial.suggest_float("alpha", 1e-5, 1e-2, log=True),
+            "learning_rate_init": trial.suggest_float(
+                "learning_rate_init", 1e-4, 1e-2, log=True
+            ),
+            "max_iter": 300,
+            "random_state": 42
+        }
+
+        model = MLPClassifier(**params)
+        model.fit(X_train, y_train)
+        preds = model.predict(X_val)
+        return accuracy_score(y_val, preds)
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=20, show_progress_bar=False)
+
+    best_model = MLPClassifier(**study.best_params,
+                               max_iter=300,
+                               random_state=42)
+    best_model.fit(X_train, y_train)
+
+    return best_model.coefs_, best_model.intercepts_
+
+# ------------------------------------------------------------
+# MODEL AGGREGATION (FedAvg)
+# ------------------------------------------------------------
+def aggregate_models(weights_list):
+    avg_w, avg_b = [], []
+
+    for layer in zip(*weights_list):
+        avg_w.append(np.mean([w[0] for w in layer], axis=0))
+        avg_b.append(np.mean([w[1] for w in layer], axis=0))
+
+    return avg_w, avg_b
+
+# ------------------------------------------------------------
+# FOMCERVIX MAIN MODEL
+# ------------------------------------------------------------
+def fomcervix_model(X, y, config):
+
+    # Centralized MLP (Ablation)
+    if not config["USE_FEDERATED"]:
+        X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2)
+        model = MLPClassifier(hidden_layer_sizes=(64,), max_iter=300)
+        model.fit(X_tr, y_tr)
+        acc = accuracy_score(y_val, model.predict(X_val))
+        return acc
+
+    # Federated Learning
+    partitions = partition_dataset(X, y, config["CLIENTS"])
+
+    global_model = MLPClassifier(hidden_layer_sizes=(64,),
+                                 max_iter=1,
+                                 warm_start=True)
+    global_model.fit(X[:10], y[:10])  # dummy init
+
+    for r in range(config["ROUNDS"]):
+        local_weights = []
+
+        for client in partitions:
+            X_tr, X_val, y_tr, y_val = prepare_data(
+                client, config["USE_SMOTE"]
+            )
+
+            weights = local_train(
+                X_tr, X_val, y_tr, y_val, config["USE_OPTUNA"]
+            )
+            local_weights.append(weights)
+
+        w_avg, b_avg = aggregate_models(local_weights)
+        global_model.coefs_ = w_avg
+        global_model.intercepts_ = b_avg
+
+    preds = global_model.predict(X)
+    acc = accuracy_score(y, preds)
+    return acc
+
+# ------------------------------------------------------------
+# ABLATION STUDY EXECUTION
+# ------------------------------------------------------------
+experiments = [
+    {"USE_FEDERATED": True,  "USE_SMOTE": True,  "USE_OPTUNA": True},
+    {"USE_FEDERATED": True,  "USE_SMOTE": True,  "USE_OPTUNA": False},
+    {"USE_FEDERATED": True,  "USE_SMOTE": False, "USE_OPTUNA": True},
+    {"USE_FEDERATED": False, "USE_SMOTE": False, "USE_OPTUNA": False}
+]
+
+results = []
+
+for exp in experiments:
+    cfg = ABLATION_CONFIG.copy()
+    cfg.update(exp)
+
+    acc = fomcervix_model(X, y, cfg)
+
+    results.append({
+        "Federated": exp["USE_FEDERATED"],
+        "SMOTE": exp["USE_SMOTE"],
+        "Optuna": exp["USE_OPTUNA"],
+        "Accuracy": acc
+    })
+
+results_df = pd.DataFrame(results)
+print("\nAblation Study Results:")
+print(results_df)
